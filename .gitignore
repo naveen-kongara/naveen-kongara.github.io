@@ -20,3 +20,7 @@ pnpm-debug.log*
 
 # macOS-specific files
 .DS_Store
+
+# private source material for blog articles - never commit
+/My Knowledge Base/
+/Gitlab Knowledge Base/

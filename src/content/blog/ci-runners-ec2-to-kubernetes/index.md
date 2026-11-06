@@ -1,0 +1,27 @@
+---
+title: "Moving CI runners from a single EC2 instance to Kubernetes"
+description: "A proof of concept for moving CI job execution off one fixed host and onto a Kubernetes executor, and what the testing actually turned up."
+date: "Jul 24 2026"
+---
+
+Our CI runner setup was one EC2 instance running the Docker executor. It worked, but it had a hard ceiling: whatever that one host could run concurrently was the limit, full stop. If jobs piled up, they queued. There was no scaling it elastically short of resizing the box, and resizing a box you can't take down mid-job isn't something you do casually.
+
+The obvious alternative was moving job execution onto our existing Kubernetes cluster using the Kubernetes executor instead of the Docker executor. Jobs become pods, and pod capacity scales with the cluster instead of being capped by one machine. The goal for this phase wasn't to flip everything over. It was a proof of concept: prove the Kubernetes executor behaves correctly and performs comparably to what we had, for a representative slice of our job types, using isolated test runner tags that don't touch real pipelines, before proposing an actual cutover plan.
+
+A few design decisions shaped the POC:
+
+- We picked a cluster that already had the identity-federation add-on installed and that mostly carries internal/non-customer-facing workloads, specifically to keep CI blast radius away from anything customer-facing.
+- For authentication from runner pods to AWS, we used pod identity associations rather than the older IAM-roles-for-service-accounts pattern — binding a service account to an IAM role out of band, no manual annotation needed. That's the direction all our new workloads were already heading.
+- One of our job types does an actual Docker build-and-push and needs a privileged Docker-in-Docker sidecar to do it. Rather than rewrite that job to use a rootless builder, we kept Docker-in-Docker for this phase and changed nothing except which runner tag it targets. Minimizing the number of things that changed at once made the result of the test easier to interpret.
+
+We stood up one runner pool per job type — a plain Alpine pool, a linter pool, a Ruby test pool, a JVM pool, and the Docker-in-Docker pool — each with its own tag so only test pipelines could reach them. Every pool needed its own IAM role too, since the Docker-in-Docker pool legitimately needs push access that the others don't, and giving everything the same broad role would have undone the whole point of scoping blast radius per pool.
+
+One thing I didn't anticipate going in: with the old setup, the runner host was always warm, so there was never any startup delay. With pod-based execution, a job landing on a pool with no spare node capacity has to wait for the cluster to provision a node before the pod can even start, which showed up as a couple of minutes of the job just sitting there. That's not a bug, it's the tradeoff for elastic capacity instead of a fixed host. Jobs landing on an already-warm node started immediately, same as before.
+
+The build cache was the other place behavior genuinely changed shape, not just speed. The old runner cached to local disk on the host, which is about as fast as caching gets. Pods are ephemeral, so a Kubernetes-executor job can't cache locally — there's nothing to be local to by the next run. We pointed every pool at a shared object-storage cache instead. That adds a small network round trip per job that didn't exist before, but once nodes were warm, total pipeline time came out roughly the same. The cache isn't optional here the way it might feel optional elsewhere — without a shared cache, every single job on the new executor would start cold.
+
+For testing, we didn't try to re-run every project against every pool. Most of our repositories share the same small set of CI pipeline templates, so retesting ten repositories using the same templates would mostly retest the same five pools five times over. Instead we picked two repositories that were as different from each other as possible — one that exercises a real database-backed test suite plus the privileged build-and-push path, and one that's a completely different runtime doing a large, memory-heavy build — so each pass actually stressed a different part of the system instead of repeating the same thing.
+
+What came out of it: jobs completed correctly on both test repositories, with throughput on par with the old executor once node capacity was warm, and no correctness problems in anything we exercised. The honest caveats are that we only validated a handful of the runner pools and language-version combinations we actually run in production, and all five test pools currently share one namespace that has to be marked privileged just to let the one Docker-in-Docker pool through — which means the other four pools are more exposed than they need to be. Splitting that out into its own namespace with its own role is designed but not yet built.
+
+The plan from here is staged, not a cutover: one low-risk pipeline moves over first and gets watched for a while, then more pipelines migrate in batches, and the old host stays registered and running the entire time as an instant fallback. Rolling back at any point during that is just pointing a pipeline's runner tag back at the old pool — nothing to migrate, since the job pods are stateless and the cache already lives centrally.
